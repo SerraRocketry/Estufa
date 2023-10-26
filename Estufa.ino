@@ -1,106 +1,512 @@
+#include <DHT.h>
 #include <LiquidCrystal.h>
-# include <Adafruit_Sensor.h>
-# include <DHT.h>
-# include <DHT_U.h>
+#include <PID_v1.h>
+#include <RotaryEncoder.h>
+#include <Pushbutton.h>
 
-# define DHTPIN 8    // Digital pin connected to the DHT sensor 
+// Constants
+#define PIN_FAN 9
+#define PIN_INPUT 14
+#define PIN_OUTPUT 8
+#define RT0 100000 // Ω
+#define B 3950     // K
+#define resist 8
+#define VCC 5  // Supply voltage
+#define R 4700 // R=10KΩ
 
-# define DHTTYPE    DHT22     // DHT 22 (AM2302)
+// Constants LCD, Encoder and DHT22
+#define DHT_PIN 4a
+#define DHT_TYPE DHT22
+#define LCD_COLS 20
+#define LCD_ROWS 4
+#define BTN_EN1 31
+#define BTN_EN2 33
+#define BTN_ENC 35
 
-// Define the pins that will be used for LCD connection
-LiquidCrystal lcd(2,3,4,5,6,7);
+RotaryEncoder encoder(BTN_EN1, BTN_EN2, RotaryEncoder::LatchMode::TWO03);
+Pushbutton button(BTN_ENC);
 
-DHT_Unified dht(DHTPIN, DHTTYPE);
+// Initialize the DHT sensor
+DHT dht(DHT_PIN, DHT_TYPE);
 
-uint32_t delayMS;
+// Initialize the LCD object
+const int rs = 16, en = 17, d4 = 23, d5 = 25, d6 = 27, d7 = 29;
+const int buzzer = 37;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+int linha[4] = {0, 1, 2, 3};
 
-void setup() {
+unsigned long lastMillis = millis();
 
-  // Initialize serial communication
-  Serial.begin(9600);
+byte Celsius[8] =
+{
+  0b11000,
+  0b11000,
+  0b00000,
+  0b00110,
+  0b01001,
+  0b01000,
+  0b01001,
+  0b00110
+};
+byte Seta1[8] =
+{
+  0b00000,
+  0b00000,
+  0b00000,
+  0b01111,
+  0b01111,
+  0b00000,
+  0b00000,
+  0b00000
+};
+byte Seta2[8] =
+{
+  0b10000,
+  0b11000,
+  0b11100,
+  0b11110,
+  0b11110,
+  0b11100,
+  0b11000,
+  0b10000
+};
 
-  // Initialize LCD screen
-  lcd.begin(16, 2);
+float temp;
+float umi;
+float mesa;
+int FANTEMP = 35;
+int FANMAX = 25;
+int FANMIN = 20;
 
-  // Initialize DHT sensor
-  dht.begin();  
+const float T0 = 20 + 273.15;
+float RT, VR, ln, TX, VRT;
 
-  // Print temperature sensor details.
-  sensor_t sensor;
-  dht.temperature().getSensor(&sensor);
+double Setpoint, Input, Output;
 
-  Serial.println(F("------------------------------------"));
-  Serial.println(F("Temperature Sensor"));
-  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
-  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
-  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
-  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("°C"));
-  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("°C"));
-  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("°C"));
-  Serial.println(F("------------------------------------"));
+// Specify the links and initial tuning parameters
+double Kp = 15, Ki = 1, Kd = 15;
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
-  // Print humidity sensor details.
-  dht.humidity().getSensor(&sensor);
+double readTemperature()
+{
+  VRT = analogRead(PIN_INPUT);  // Acquisition analog value of VRT
+  VRT = (5.00 / 1023.00) * VRT; // Conversion to voltage
+  VR = VCC - VRT;
+  RT = VRT / (VR / R); // Resistance of RT
 
-  Serial.println(F("Humidity Sensor"));
-  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
-  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
-  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
-  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("%"));
-  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("%"));
-  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("%"));
-  Serial.println(F("------------------------------------"));
+  ln = log(RT / RT0);
+  TX = (1 / ((ln / B) + (1 / T0))); // Temperature from thermistor
 
-  // Set delay between sensor readings based on sensor details.
-  delayMS = sensor.min_delay / 1000;
-
+  TX = TX - 273.15; // Conversion to Celsius
+  return TX;
 }
 
-void loop() {
-  
-  delay(delayMS);
-
-  // Get temperature event and print its value.
-  sensors_event_t event;
-  dht.temperature().getEvent(&event);
-
-  if (isnan(event.temperature)) {
-    Serial.println(F("Error reading temperature!"));
-    lcd.print("Error reading temperature!");  
+void lcdprint()
+{
+  if (lastMillis < millis() - 1000)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("Temp. Geral: ");
+    lcd.print(temp);
+    lcd.print(" ");
+    lcd.write(byte(0));
+    lcd.print(" ");
+    lcd.setCursor(0, 1);
+    lcd.print("Temp. Mesa: ");
+    lcd.print(mesa);
+    lcd.print(" ");
+    lcd.write(byte(0));
+    lcd.print(" ");
+    lcd.setCursor(0, 2);
+    lcd.print("Umidade: ");
+    lcd.print(umi);
+    lcd.print(" % ");
+    lcd.setCursor(0, 3);
+    lcd.print("PWM: ");
+    lcd.print(map(Output, 0, 255, 0, 100));
+    lcd.print(" % ");
+    lastMillis = millis();
   }
-  else {
+}
 
-    lcd.setCursor(5, 0);    // set the cursor position
+void serialdata()
+{
+  temp = dht.readTemperature();
+  umi = dht.readHumidity();
+  mesa = readTemperature();
+  Serial.print("Temperatura: ");
+  Serial.print(temp);
+  Serial.print(" °C   Umidade: ");
+  Serial.print(umi);
+  Serial.print(" %   ");
+  Serial.print("Temperatura mesa: ");
+  Serial.print(mesa);
+  Serial.print(" °C");
+  Serial.print("   Setpoint: ");
+  Serial.print(Setpoint);
+  Serial.print(" °C");
+  Serial.print("   PWM: ");
+  Serial.print(map(Output, 0, 255, 0, 100));
+  Serial.println(" % ");
+}
 
-    // print a message to the LCD
-    lcd.print(event.temperature); 
-    lcd.print("C"); 
-    Serial.print(F("Temperatura: "));
-    Serial.print(event.temperature);
-    Serial.println(F("°C"));
+void setpointconfig()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp. Mesa: ");
+  lcd.setCursor(0, 1);
+  lcd.print(mesa);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print(" ");
+  lcd.setCursor(0, 2);
+  lcd.print("Objetivo: ");
+  lcd.setCursor(0, 3);
+  lcd.print(Setpoint);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print(" ");
+  while (true)
+  {
+    static int pos = 0;
+    encoder.tick();
+    int newPos = encoder.getPosition();
+    if (pos != newPos)
+    {
+      Setpoint += (int)(encoder.getDirection());
+      lcd.setCursor(0, 0);
+      lcd.print("Temp. Mesa: ");
+      lcd.setCursor(0, 1);
+      lcd.print(mesa);
+      lcd.print(" ");
+      lcd.write(byte(0));
+      lcd.print(" ");
+      lcd.setCursor(0, 2);
+      lcd.print("Objetivo: ");
+      lcd.setCursor(0, 3);
+      lcd.print(Setpoint);
+      lcd.print(" ");
+      lcd.write(byte(0));
+      lcd.print(" ");
+      Serial.print("Temperatura mesa: ");
+      Serial.print(mesa);
+      Serial.print(" °C || ");
+      Serial.print("Setpoint: ");
+      Serial.print(Setpoint);
+      Serial.println(" °C");
+      pos = newPos;
+    }
+    if (button.getSingleDebouncedPress())
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.write(byte(1));
+      lcd.write(byte(2));
+      lcd.setCursor(2, 0);
+      lcd.print("Temp. Setpoint ");
+      lcd.setCursor(2, 1);
+      lcd.print("Temp. Ativ. FAN ");
+      lcd.setCursor(2, 2);
+      lcd.print("Umi. Ativ. FAN ");
+      lcd.setCursor(2, 3);
+      lcd.print("Voltar ");
+      break;
+    }
   }
+}
 
-  // Get humidity event and print its value.
-  dht.humidity().getEvent(&event);
-
-  if (isnan(event.relative_humidity)) {
-
-    Serial.println(F("Error reading humidity!"));
-    lcd.print("Error reading humidity!");  
-    
+void tempfanconfig()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ativa em: ");
+  lcd.setCursor(0, 1);
+  lcd.print(FANTEMP);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print(" ");
+  lcd.setCursor(0, 2);
+  lcd.print("Mudar para: ");
+  lcd.setCursor(0, 3);
+  lcd.print(FANTEMP);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print(" ");
+  while (true)
+  {
+    static int pos = 0;
+    encoder.tick();
+    int newPos = encoder.getPosition();
+    if (pos != newPos)
+    {
+      FANTEMP += (int)(encoder.getDirection());
+      lcd.setCursor(0, 2);
+      lcd.print("Mudar para: ");
+      lcd.setCursor(0, 3);
+      lcd.print(FANTEMP);
+      lcd.print(" ");
+      lcd.write(byte(0));
+      lcd.print(" ");
+      Serial.print("Temperatura de ativação da FAN: ");
+      Serial.print(FANTEMP);
+      Serial.println(" °C");
+      pos = newPos;
+    }
+    if (button.getSingleDebouncedPress())
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.write(byte(1));
+      lcd.write(byte(2));
+      lcd.setCursor(2, 0);
+      lcd.print("Temp. Setpoint ");
+      lcd.setCursor(2, 1);
+      lcd.print("Temp. Ativ. FAN ");
+      lcd.setCursor(2, 2);
+      lcd.print("Umi. Ativ. FAN ");
+      lcd.setCursor(2, 3);
+      lcd.print("Voltar ");
+      break;
+    }
   }
-  else {
-    
-    lcd.setCursor(5, 1);     // set the cursor position
+}
 
-    // print a message to the LCD
-    lcd.print(event.relative_humidity);       
-    lcd.print("%"); 
-    Serial.print(F("Umidade: "));
-    Serial.print(event.relative_humidity);
-    Serial.println(F("%"));
+void umimaxfanconfig()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ativa em: ");
+  lcd.setCursor(0, 1);
+  lcd.print(FANMAX);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print("% ");
+  lcd.setCursor(0, 2);
+  lcd.print("Mudar para: ");
+  lcd.setCursor(0, 3);
+  lcd.print(FANMAX);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print("% ");
+  while (true)
+  {
+    static int pos = 0;
+    encoder.tick();
+    int newPos = encoder.getPosition();
+    if (pos != newPos)
+    {
+      FANMAX += (int)(encoder.getDirection());
+      lcd.setCursor(0, 2);
+      lcd.print("Mudar para: ");
+      lcd.setCursor(0, 3);
+      lcd.print(FANMAX);
+      lcd.print(" % ");
+      Serial.print("Umidade de ativação da FAN: ");
+      Serial.print(FANMAX);
+      Serial.println(" % ");
+      pos = newPos;
+    }
+    if (button.getSingleDebouncedPress())
+    {
+      umiminfanconfig();
+      break;
+    }
   }
-  
-  delay(1000);                    
+}
 
+void umiminfanconfig()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Desativa em: ");
+  lcd.setCursor(0, 1);
+  lcd.print(FANMIN);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print("% ");
+  lcd.setCursor(0, 2);
+  lcd.print("Mudar para: ");
+  lcd.setCursor(0, 3);
+  lcd.print(FANMIN);
+  lcd.print(" ");
+  lcd.write(byte(0));
+  lcd.print("% ");
+  while (true)
+  {
+    static int pos = 0;
+    encoder.tick();
+    int newPos = encoder.getPosition();
+    if (pos != newPos)
+    {
+      FANMIN += (int)(encoder.getDirection());
+      lcd.setCursor(0, 2);
+      lcd.print("Mudar para: ");
+      lcd.setCursor(0, 3);
+      lcd.print(FANMIN);
+      lcd.print(" % ");
+      Serial.print("Umidade de desativação da FAN: ");
+      Serial.print(FANMIN);
+      Serial.println(" % ");
+      pos = newPos;
+    }
+    if (button.getSingleDebouncedPress())
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.write(byte(1));
+      lcd.write(byte(2));
+      lcd.setCursor(2, 0);
+      lcd.print("Temp. Setpoint ");
+      lcd.setCursor(2, 1);
+      lcd.print("Temp. Ativ. FAN ");
+      lcd.setCursor(2, 2);
+      lcd.print("Umi. Ativ. FAN ");
+      lcd.setCursor(2, 3);
+      lcd.print("Voltar ");
+      break;
+    }
+  }
+}
+
+void menu()
+{
+  int i = 0;
+  lcd.clear();
+  lcd.setCursor(0, linha[i]);
+  lcd.write(byte(1));
+  lcd.write(byte(2));
+  lcd.setCursor(2, 0);
+  lcd.print("Temp. Setpoint ");
+  lcd.setCursor(2, 1);
+  lcd.print("Temp. Ativ. FAN ");
+  lcd.setCursor(2, 2);
+  lcd.print("Umi. Ativ. FAN ");
+  lcd.setCursor(2, 3);
+  lcd.print("Voltar ");
+  int s = 1;
+  while (s == 1)
+  {
+    static int pos = 0;
+    encoder.tick();
+    int newPos = encoder.getPosition();
+    if (pos != newPos)
+    {
+      lcd.clear();
+      i += (int)(encoder.getDirection());
+      if (i > 3)
+      {
+        i = 0;
+      }
+      if (i < 0)
+      {
+        i = 3;
+      }
+      lcd.setCursor(0, linha[i]);
+      lcd.write(byte(1));
+      lcd.write(byte(2));
+      lcd.setCursor(2, 0);
+      lcd.print("Temp. Setpoint ");
+      lcd.setCursor(2, 1);
+      lcd.print("Temp. Ativ. FAN ");
+      lcd.setCursor(2, 2);
+      lcd.print("Umi. Ativ. FAN ");
+      lcd.setCursor(2, 3);
+      lcd.print("Voltar ");
+      pos = newPos;
+    }
+    if (button.getSingleDebouncedPress())
+    {
+      switch (linha[i])
+      {
+        case 0: // setpoint
+          setpointconfig();
+          break;
+        case 1: // temperatura de ativação da fan
+          tempfanconfig();
+          break;
+        case 2: // umidade de ativação da fan
+          umimaxfanconfig();
+          break;
+        case 3: // voltar
+          s = 0;
+          break;
+      }
+    }
+  }
+}
+
+void calcPID()
+{
+  Input = readTemperature();
+  myPID.Compute();
+  analogWrite(PIN_OUTPUT, Output);
+}
+
+void ativaFAN()
+{
+  if (temp > FANTEMP)
+  {
+    if (umi > FANMAX)
+    {
+      analogWrite(PIN_FAN, 100);
+    }
+    else if (umi <= FANMIN)
+    {
+      analogWrite(PIN_FAN, 0);
+    }
+  }
+  else
+  {
+    analogWrite(PIN_FAN, 0);
+  }
+}
+
+void setup()
+{
+  Serial.begin(9600);
+  // Initialize the DHT sensor
+  dht.begin();
+  // Initialize the LCD
+  lcd.begin(LCD_COLS, LCD_ROWS);
+  lcd.createChar(0, Celsius);
+  lcd.createChar(1, Seta1);
+  lcd.createChar(2, Seta2);
+
+  pinMode(BTN_ENC, INPUT);
+  pinMode(PIN_OUTPUT, OUTPUT);
+  pinMode(PIN_FAN, OUTPUT);
+  pinMode(buzzer, OUTPUT);
+
+  Input = readTemperature();
+  Setpoint = 130;
+
+  // turn the PID on
+  myPID.SetMode(AUTOMATIC);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Inicializando");
+  for (int i = 0; i <= 6; i++)
+  {
+    lcd.print(".");
+    delay(200);
+  }
+  digitalWrite(buzzer, HIGH);
+  delay(200);
+  digitalWrite(buzzer, LOW);
+  lcd.setCursor(0, 1);
+  lcd.print("Pronto!");
+  delay(800);
+}
+
+void loop()
+{
+  calcPID();
+  serialdata();
+  ativaFAN();
+  if (button.getSingleDebouncedPress())
+  {
+    menu();
+  }
+  lcdprint();
 }
